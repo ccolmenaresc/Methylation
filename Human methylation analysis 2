@@ -1,0 +1,219 @@
+#DNA methylation profiling for 850k reannotation and normalization evaluation [850k]
+# Load packages ----------------------------------------------------------------------------------------------
+BiocManager::install("minfiData")
+BiocManager::install("Gviz")
+BiocManager::install("DMRcate")
+install.packages("stringr")
+BiocManager::install("IlluminaHumanMethylationEPICanno.ilm10b2.hg19", force=TRUE)
+BiocManager::install("IlluminaHumanMethylationEPICmanifest")
+
+library(knitr)
+library(limma)
+library(minfi)
+#library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+#library(IlluminaHumanMethylation450kmanifest)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+library(RColorBrewer)
+library(missMethyl)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+
+setwd("path")
+
+#Loading the data --------------------------------------------------------------------------------------------
+# 850k annotation data 
+# The manifest contains all of the annotation information for each of the CpG probes on the 85k array. 
+#This is useful for determining where any differentially methylated probes are located in a genomic context.
+
+annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+head(annEPIC)
+
+#increase file download timeout
+options(timeout = 600)
+
+#download GEO object
+gse <- getGEO("GSE198627", GSEMatrix = TRUE)
+#get phenotype data - sample sheet
+pd = pData(gse[[1]])
+pd <- pd[-(1:6),]
+View(pd)
+
+#list files
+head(list.files("~/R/PROJECT/data/GSE198627", pattern = "idat"))
+
+# read in the raw data from the IDAT files 
+rgSet <- read.metharray.exp("~/R/PROJECT/data/GSE198627")
+rgSet
+
+saveRDS(rgSet, "rgSet_GSE198627.RDS")
+rgSet <- readRDS(file = "rgSet_GSE198627.RDS")
+
+
+# Read in the "sample sheet" for the experiment --> issues with the type of file
+targets <- read.metharray.sheet("~/R/PROJECT/data", pattern=".txt")
+targets
+View(targets)
+colnames(targets)
+
+
+
+getManifest(rgSet)
+
+# rename the samples with more descriptive names.
+colnames(rgSet) <- rep(c("tumor", "normal"), c(10,4))
+colnames(rgSet)
+dim(rgSet)
+
+# Pre-processing od data -------------------------------------------------------------------------------------
+MSet <- preprocessRaw(rgSet)
+MSet
+# Compare to previous object
+rgSet
+
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+# Observe the change of the assays
+ratioSet
+
+gset <- mapToGenome(ratioSet)
+gset
+
+beta <- getBeta(gset)
+head(beta)
+m <- getM(gset)
+head(m)
+cn <- getCN(gset)
+head(cn)
+
+# Quality control --------------------------------------------------------------------------------------------
+
+qc <- getQC(MSet)
+plotQC(qc)
+
+#We can generate a detection p-value for every CpG in every sample, which is indicative of the quality of the
+#signal. The method used by minfi to calculate detection p-values compares the total signal (M+U) for each 
+#probe to the background signal level, which is estimated from the negative control probes. Very small 
+#p-values are indicative of a reliable signal, while large p-values, for example >0.01, generally indicate a 
+#poor quality signal.
+
+detP <- detectionP(rgSet)
+head(detP)
+
+#Next we need to examine mean detection p-values across all samples to identify any failed samples, and plot
+#the mean detection p-value for each sample.
+
+pal <- brewer.pal(8,"Dark2")
+par(mfrow=c(1,1))
+barplot(colMeans(detP),col=pal[factor(colnames(rgSet))] ,las=2, cex.names=0.8, ylim=c(0,0.002), main="Mean detection p-values")
+abline(h=0.05,col="red")
+legend("topleft", legend=levels(factor(colnames(rgSet))), fill=pal, bg="white")
+
+#remove poor quality samples from rgSet
+keep <- colMeans(detP) < 0.05
+#rgSet <- rgSet[,keep]
+#rgSet
+#dim(rgSet)  #didn't change
+
+#remove poor quality samples from detection p-values
+detP <- detP[,keep]
+dim(detP)
+
+
+#The minfi qcReport function generates many other useful quality control plots. The minfi vignette describes 
+#the various plots and how they should be interpreted in detail.
+
+qcReport(rgSet, sampNames=colnames(rgSet), sampGroups=colnames(rgSet),pdf="qcReport.pdf")
+
+# Normalization ----------------------------------------------------------------------------------------------
+#The purpose of data normalization is to minimize the unwanted variation within and between samples. We will
+#apply the preprocessQuantile method to our data. This function implements a stratified quantile normalisation
+#procedure which is applied to the methylated and unmethylated signal intensities separately, and takes into 
+#account the different probe types. Note that after normalization, the data is housed in a GenomicRatioSet 
+#object. This is a much more compact representation of the data as the colour channel information has been 
+#discarded and the M and U intensity information has been converted to M-values and beta values, together with
+#associated genomic coordinates. We can visualize what the data look like before and after normalization.
+
+mSetSq <- preprocessQuantile(rgSet) 
+
+par(mfrow=c(1,2))
+# Plot distributions prior to normalization for sample 1
+plotBetasByType(MSet[,1],main="Raw")
+# The normalized object is a GenomicRatioSet which does not contain
+# the necessary probe info, we need to extract this from the MethylSet first.
+typeI <- getProbeInfo(MSet, type = "I")[, c("Name","nCpG")]
+typeII <- getProbeInfo(MSet, type = "II")[, c("Name","nCpG")]
+probeTypes <- rbind(typeI, typeII)
+probeTypes$Type <- rep(x = c("I", "II"), times = c(nrow(typeI), nrow(typeII)))
+# Now plot the distributions of the normalized data for sample 1
+plotBetasByType(getBeta(mSetSq)[,1], probeTypes = probeTypes, main="Normalized",)
+
+# visualise what the data looks like before and after normalisation
+par(mfrow=c(1,2))
+densityPlot(rgSet, sampGroups=colnames(rgSet),main="Raw", legend=FALSE)
+legend("top", legend = levels(factor(colnames(rgSet))),
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(getBeta(mSetSq), sampGroups=colnames(rgSet),
+            main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(colnames(rgSet))),
+       text.col=brewer.pal(8,"Dark2"))
+
+# Data exploration -------------------------------------------------------------------------------------------
+
+
+# MDS plots to look at largest sources of variation
+par(mfrow=c(1,1))
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(colnames(rgSet))])
+legend("top", legend=levels(factor(colnames(rgSet))), text.col=pal,
+       bg="white", cex=0.7)
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common",  
+        col=pal[factor(colnames(rgSet))])
+legend("top", legend=levels(colnames(rgSet)), text.col=pal,
+       bg="white", cex=0.7)
+
+
+# Filtering --------------------------------------------------------------------------------------------------
+
+# ensure probes are in the same order in the mSetSq and detP objects
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),] 
+
+# remove any probes that have failed in one or more samples
+keep <- rowSums(detP < 0.01) == ncol(mSetSq) 
+table(keep)
+
+mSetSqFlt <- mSetSq[keep,]
+mSetSqFlt
+
+#I downloaded the file from here: https://github.com/IARCbioinfo/Methylation_analysis_scripts
+# exclude cross reactive probes 
+xReactiveProbes <- read.csv(file=paste("~/R/PROJECT/data",
+                                       "13059_2016_1066_MOESM1_ESM_cross-reactive_probes.csv",
+                                       sep="/"), stringsAsFactors=FALSE)
+keep <- !(featureNames(mSetSqFlt) %in% xReactiveProbes$TargetID)
+table(keep)
+
+mSetSqFlt <- mSetSqFlt[keep,] 
+mSetSqFlt
+
+par(mfrow=c(1,2))
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", col=pal[factor(colnames(rgSet))])
+legend("top", legend=levels(factor(colnames(rgSet))), text.col=pal,bg="white", cex=0.7)
+
+
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common",  col=pal[factor(targets$Sample_Source)])
+legend("right", legend=levels(factor(targets$Sample_Source)), text.col=pal,cex=0.7, bg="white")
+
+
+
+#increase file download timeout
+options(timeout = 600)
+
+#download GEO object
+gse <- getGEO("GSE198627", GSEMatrix = TRUE)
+#get phenotype data - sample sheet
+pd = pData(gse[[1]])
+View(pd)
