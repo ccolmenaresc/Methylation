@@ -1,0 +1,180 @@
+BiocManager::install("IlluminaHumanMethylation27kanno.ilmn12.hg19")
+BiocManager::install("IlluminaHumanMethylation27kmanifest")
+BiocManager::install("ComplexHeatmap")
+
+library("ComplexHeatmap")
+library("TCGAbiolinks")
+library("limma")
+library("edgeR")
+library("glmnet")
+library("factoextra")
+library("FactoMineR")
+library("caret")
+library("SummarizedExperiment")
+library("gplots")
+library("ggplot2")
+library("survival")
+library("survminer")
+library("RColorBrewer")
+library("gProfileR")
+library("genefilter")
+library("IlluminaHumanMethylation27kanno.ilmn12.hg19")
+library("IlluminaHumanMethylation27kmanifest")
+
+setwd("path")
+
+TCGAbiolinks:::getProjectSummary("TCGA-BRCA")
+
+#Download data for BRCA (Breast Cancer)
+query_TCGA = GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "DNA methylation", # parameter enforced by GDCquery,
+  platform = "Illumina Human Methylation 27",
+  data.type ="Methylation beta value", 
+  legacy = TRUE) #legacy helps chech if there is duplicated cases
+
+brca_res = getResults(query_TCGA)
+colnames(brca_res)
+head(brca_res$sample_type) 
+summary(factor(brca_res$sample_type))
+
+#Here I take out the metastatic sample type, there were only 2 ((793) 314 primary and (97) 27 normal)
+query_TCGA = GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "DNA methylation", # parameter enforced by GDCquery,
+  platform = "Illumina Human Methylation 27",
+  data.type ="Methylation beta value",
+  sample.type = c("Solid Tissue Normal","Primary Tumor"),
+  legacy = TRUE)
+
+############################################ Data download and preparation ###########################################
+
+GDCdownload(query = query_TCGA)
+tcga_data <- GDCprepare(query_TCGA)
+dim(tcga_data)   
+rowRanges(tcga_data)
+colData(tcga_data)
+
+#saving the tcga_data object
+saveRDS(object = tcga_data,
+        file = "tcga_data.RDS",
+        compress = FALSE)
+
+#Loading saved session: Once you saved your data, you can load it into your environment: 
+tcga_data = readRDS(file = "tcga_data.RDS")
+dim(tcga_data)
+
+#######################################################################################################################
+# didn't show much information
+summary(factor(clinical$paper_pathologic_stage))
+tcga_data <- tcga_data[rowSums(is.na(assay(tcga_data))) == 0,]
+
+# plot 10 most variable probes
+tcga_data %>% 
+  assay %>% 
+  rowVars %>% 
+  order(decreasing = TRUE) %>% 
+  head(10) -> idx
+
+idx
+
+pal_methylation <- colorRampPalette(c("#000436",
+                                      "#021EA9",
+                                      "#1632FB",
+                                      "#6E34FC",
+                                      "#C732D5",
+                                      "#FD619D",
+                                      "#FF9965",
+                                      "#FFD32B",
+                                      "#FFFC5A"))(100)
+
+Heatmap(assay(tcga_data)[idx,],
+        show_column_names = TRUE, 
+        show_row_names = TRUE,
+        name = "Methylation Beta-value", 
+        row_names_gp = gpar(fontsize = 8),
+        column_names_gp = gpar(fontsize = 8),
+        col = circlize::colorRamp2(seq(0, 1, by = 1/99), pal_methylation))
+
+TCGAvisualize_meanMethylation(tcga_data, groupCol = "paper_pathologic_stage",filename = NULL)
+
+data <- TCGAanalyze_DMC(
+  data = tcga_data1, 
+  groupCol = "paper_pathologic_stage",
+  #group1 = "Stage_I",
+  #group2 = "Stage_II",
+  group1 = "Stage_III",
+  group2 = "Stage_IV",
+  p.cut = 10^-5,
+  diffmean.cut = 0.25,
+  legend = "State",
+  plot.filename = "stages_metvolcano.png"
+)
+#######################################################################################################################
+
+#met matrix
+met <- as.data.frame(SummarizedExperiment::assay(tcga_data))
+dim(met)
+View(met)
+
+# clinical data
+clinical <- data.frame(tcga_data@colData)
+dim(clinical)
+View(clinical)
+colnames(clinical)
+
+######################################## Inspecting methylation data ##################################################
+
+# get the 27k annotation data
+ann27k <- getAnnotation(IlluminaHumanMethylation27kanno.ilmn12.hg19)
+head(ann27k)
+
+# remove probes with NA
+probe.na <- rowSums(is.na(met))
+summary(probe.na)
+head(probe.na)
+table(probe.na == 0)
+probe <- probe.na[probe.na == 0]
+met <- met[row.names(met) %in% names(probe), ]
+View(met)
+dim(met)
+
+#Depending on the nature of your samples and your biological question you may also choose to filter out the probes from 
+#the X and Y chromosomes or probes that are known to have common SNPs at the CpG site. As the samples in this dataset 
+#were all derived from male donors, we will not be removing the sex chromosome probes as part of this analysis, however 
+#example code is provided below. A different dataset, which contains both male and female samples, is used to demonstrate
+#a Differential Variability analysis and provides an example of when sex chromosome removal is necessary.
+
+# remove probes that match chromosome  X and Y 
+keep <- !(row.names(met) %in% ann27k$Name[ann27k$chr %in% c("chrX","chrY")])
+table(keep)
+met <- met[keep, ]
+rm(keep) # remove no further needed probes.
+
+#There is a function in minfi that provides a simple interface for the removal of probes where common SNPs may affect the
+#CpG. You can either remove all probes affected by SNPs (default), or only those with minor allele frequencies greater
+#than a specified value.
+
+# remove SNPs overlapped probe
+table(is.na(ann27k$Probe_rs))
+
+# probes without snp
+no.snp.probe <- ann27k$Name[is.na(ann27k$Probe_rs)]
+
+snp.probe <- ann27k[!is.na(ann27k$Probe_rs), ]
+
+#snps with maf <= 0.05
+snp5.probe <- snp.probe$Name[snp.probe$Probe_maf <= 0.05]
+
+# filter met
+met <- met[row.names(met) %in% c(no.snp.probe, snp5.probe), ]
+
+#remove no-further needed dataset
+rm(no.snp.probe, probe, probe.na, snp.probe, snp5.probe)
+
+bval <- met
+dim(bval)
+## converting beta values to m_values
+## m = log2(beta/1-beta)
+mval <- t(apply(met, 1, function(x) log2(x/(1-x))))
+dim(mval)
